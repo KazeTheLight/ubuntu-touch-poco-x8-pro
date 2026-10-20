@@ -7,7 +7,11 @@ param(
     [string]$Backup   = "",
     [string]$Adb      = "",
     [string]$Fastboot = "",
-    [string]$Serials  = ""
+    [string]$Serials  = "",
+    # -Stock restores the pristine Xiaomi images from release\stock-firmware
+    # instead of backup-latest (which holds the OFox vendor_boot that was on the
+    # phone when the backups were taken).
+    [switch]$Stock
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,8 +70,12 @@ $ADB      = Resolve-Tool "adb"      $Adb
 $FASTBOOT = Resolve-Tool "fastboot" $Fastboot
 if ($Serials) { $env:ANDROID_SERIAL = $Serials }
 
-if (-not $Backup) { $Backup = Join-Path $HERE "backup-latest" }
+if (-not $Backup) {
+    if ($Stock) { $Backup = Join-Path $HERE "stock-firmware" }
+    else        { $Backup = Join-Path $HERE "backup-latest" }
+}
 if (-not (Test-Path $Backup)) { Die "no backup in $Backup" }
+Write-Host ("restoring from: {0}" -f $Backup) -ForegroundColor Cyan
 
 $bootFile = Join-Path $Backup "boot.img"
 $initFile = Join-Path $Backup "init_boot.img"

@@ -24,6 +24,7 @@ param(
     [int]$WatchSeconds = 300,
     [string]$InitBoot  = "",
     [string]$VendorBoot = "",
+    [string]$Boot      = "",
     # Wipe expdb right before flashing so the diag snapshot and the LK log can
     # only come from this attempt. Use -KeepExpdb to preserve the previous one.
     [switch]$KeepExpdb
@@ -84,6 +85,7 @@ Say "log: $Log"
 
 # ------------------------------------------------------------------- inputs
 $bootImg  = Join-Path $HERE "images\ut_boot.img"
+if ($Boot) { $bootImg = (Resolve-Path $Boot).Path }
 $initImg  = Join-Path $HERE "images\ut_init_boot.img"
 if ($InitBoot) { $initImg = (Resolve-Path $InitBoot).Path }
 # UT-owned vendor_boot (tiny, no Android userspace) is preferred; the stock
