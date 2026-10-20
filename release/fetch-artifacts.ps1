@@ -32,8 +32,9 @@ $WANTED = [ordered]@{
     "klee-boot-images" = @("ut_boot.img", "ut_init_boot.img", "ut_boot_fastboot-boot.img")
     "klee-rootfs"      = @("ubuntu.img")
     "klee-utdata"      = @("ut_data.img")
-    "klee-modules"     = @()            # informational only, not needed to install
 }
+# Not needed to install (ut_data.img already contains them), only reported.
+$INFO = @("klee-modules")
 
 function Get-GitHubToken {
     if ($Token) { return $Token.Trim() }
@@ -96,9 +97,23 @@ try {
         New-Item -ItemType Directory -Force -Path $ex | Out-Null
         Expand-Archive -Path $zip -DestinationPath $ex -Force
 
-        # artifacts keep their upload layout: copy any file found, flattening it
-        Get-ChildItem -Path $ex -Recurse -File | ForEach-Object {
-            Copy-Item $_.FullName (Join-Path $Dest $_.Name) -Force
+        # Copy only the files we asked for. The artifacts keep their upload
+        # layout, and klee-modules in particular is a whole tree of .ko files
+        # that must not end up flattened into images/.
+        foreach ($f in $WANTED[$name]) {
+            $found = Get-ChildItem -Path $ex -Recurse -File -Filter $f | Select-Object -First 1
+            if (-not $found) {
+                Write-Host "!!  $name did not contain $f" -ForegroundColor Yellow
+                continue
+            }
+            Copy-Item $found.FullName (Join-Path $Dest $f) -Force
+        }
+    }
+
+    foreach ($name in $INFO) {
+        $a = $all | Where-Object { $_.name -eq $name -and -not $_.expired } | Select-Object -First 1
+        if ($a) {
+            Write-Host ("    {0,-18} {1,7} MB  (not needed for install)" -f $a.name, [math]::Round($a.size_in_bytes / 1MB, 1))
         }
     }
 }
