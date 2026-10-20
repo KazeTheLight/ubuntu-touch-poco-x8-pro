@@ -133,9 +133,20 @@ kernel:
 |---|---|
 | `build_kernel` | `false` skips the ~30 minute kernel build |
 | `kernel_run_id` | run ID to take `klee-modules` / `klee-boot-images` from |
+| `build_rootfs` | `false` skips the ~10 minute rootfs build |
+| `rootfs_run_id` | run ID to take `klee-rootfs` (`ubuntu.img`) from when `build_rootfs=false` |
 
 With `build_kernel=false` the two later jobs pull the kernel artifacts from `kernel_run_id`
-instead of rebuilding them.
+instead of rebuilding them. With `build_rootfs=false` the `ut_data` job pulls `ubuntu.img`
+from `rootfs_run_id`; it is skipped if that is empty, since there would be nothing to pack.
+
+Example - only rebuild `ut_data.img`, reusing the kernel from run 39363143096 and the rootfs
+from run 39369109909:
+```
+build_kernel=false  kernel_run_id=39363143096
+build_rootfs=false  rootfs_run_id=39369109909
+build_utdata=true
+```
 
 Install from Windows
 --------------------

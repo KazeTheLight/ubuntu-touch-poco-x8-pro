@@ -41,6 +41,10 @@ on:
         description: "Build ubuntu.img (EROFS rootfs)"
         type: boolean
         default: true
+      rootfs_run_id:
+        description: "Run ID to take klee-rootfs from when build_rootfs is off. Empty = this run."
+        type: string
+        default: ""
       build_utdata:
         description: "Build ut_data.img (needed for a Windows install)"
         type: boolean
@@ -484,9 +488,10 @@ jobs:
     # must finish first. With only `needs: kernel` this job could start before
     # rootfs uploaded klee-rootfs and the download would fail.
     needs: [kernel, rootfs]
-    # rootfs must have produced ubuntu.img in *this* run, but the kernel job may
-    # legitimately be skipped on a retry.
-    if: ${{ always() && inputs.build_utdata && needs.rootfs.result == 'success' }}
+    # rootfs must have produced ubuntu.img, but on a retry it may be skipped and
+    # ubuntu.img taken from an earlier run (rootfs_run_id) instead - the same
+    # arrangement the kernel job already allows.
+    if: ${{ always() && inputs.build_utdata && ((inputs.build_rootfs && needs.rootfs.result == 'success') || (!inputs.build_rootfs && inputs.rootfs_run_id != '')) }}
     runs-on: ubuntu-22.04
     container: ubuntu:22.04
     timeout-minutes: 120
@@ -509,11 +514,21 @@ jobs:
           command -v mkfs.ext4
           command -v debugfs
 
-      - name: Download the rootfs image
+      - name: Download the rootfs image (this run)
+        if: ${{ inputs.build_rootfs }}
         uses: actions/download-artifact@v4
         with:
           name: klee-rootfs
           path: release/images
+
+      - name: Download the rootfs image (run ${{ inputs.rootfs_run_id }})
+        if: ${{ !inputs.build_rootfs }}
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-rootfs
+          path: release/images
+          run-id: ${{ inputs.rootfs_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download the boot images (this run)
         if: ${{ inputs.kernel_run_id == '' || inputs.build_kernel }}
@@ -553,8 +568,25 @@ jobs:
           rm -f "$RAW" "$WORK/ut_data.img"
           truncate -s "${UT_MIB}M" "$RAW"
           # Halium's initramfs ships e2fsck 1.43: keep the feature set it knows.
-          mkfs.ext4 -q -F -L ut_data -b 4096 -m 0 \
-            -O ^metadata_csum,^metadata_csum_seed,^orphan_file "$RAW"
+          # Asking for a feature this mke2fs does not know makes it reject the
+          # ENTIRE option set ("Invalid filesystem option set"), so probe each
+          # one with a dry run first. ubuntu:22.04 has e2fsprogs 1.46.5, which
+          # predates orphan_file; some runners have a newer one that needs it
+          # switched off.
+          FSOPT=""
+          for f in metadata_csum metadata_csum_seed orphan_file; do
+            if mkfs.ext4 -q -F -n -O "^$f" "$RAW" >/dev/null 2>&1; then
+              FSOPT="${FSOPT:+$FSOPT,}^$f"
+            else
+              echo "note: this e2fsprogs has no $f feature, leaving it alone"
+            fi
+          done
+          echo "ext4 feature options: ${FSOPT:-<none>}"
+          if [ -n "$FSOPT" ]; then
+            mkfs.ext4 -q -F -L ut_data -b 4096 -m 0 -O "$FSOPT" "$RAW"
+          else
+            mkfs.ext4 -q -F -L ut_data -b 4096 -m 0 "$RAW"
+          fi
 
           # debugfs cannot cope with spaces in paths; use a symlink farm.
           L="$(mktemp -d /tmp/klee-ut.XXXXXX)"
