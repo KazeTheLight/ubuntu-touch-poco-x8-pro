@@ -22,7 +22,11 @@ param(
     [string]$Adb       = "",
     [string]$Fastboot  = "",
     [int]$WatchSeconds = 300,
-    [string]$InitBoot  = ""
+    [string]$InitBoot  = "",
+    [string]$VendorBoot = "",
+    # Wipe expdb right before flashing so the diag snapshot and the LK log can
+    # only come from this attempt. Use -KeepExpdb to preserve the previous one.
+    [switch]$KeepExpdb
 )
 
 $ErrorActionPreference = "Stop"
@@ -80,9 +84,13 @@ Say "log: $Log"
 
 # ------------------------------------------------------------------- inputs
 $bootImg  = Join-Path $HERE "images\ut_boot.img"
-$initImg  = Join-Path $HERE "images\ut_init_boot_lean.img"
+$initImg  = Join-Path $HERE "images\ut_init_boot.img"
 if ($InitBoot) { $initImg = (Resolve-Path $InitBoot).Path }
-$vndImg   = Join-Path $FW   "vendor_boot.img"
+# UT-owned vendor_boot (tiny, no Android userspace) is preferred; the stock
+# Xiaomi one is only a fallback for older builds.
+$vndImg   = Join-Path $HERE "images\ut_vendor_boot.img"
+if ($VendorBoot) { $vndImg = (Resolve-Path $VendorBoot).Path }
+elseif (-not (Test-Path $vndImg)) { $vndImg = Join-Path $FW "vendor_boot.img" }
 $vbImg    = Join-Path $FW   "vbmeta.img"
 foreach ($f in @($bootImg,$initImg,$vndImg,$vbImg)) {
     if (-not (Test-Path $f)) { Die "missing: $f" }
@@ -118,6 +126,15 @@ foreach ($line in ((Tool-Out $FASTBOOT @("getvar","current-slot")) -split "`r?`n
     if ($line -match "current-slot:\s*(\S+)") { $slot = "_" + ($Matches[1] -replace "^_",""); break }
 }
 Say "active slot: $slot" Cyan
+
+# Reset the capture target: expdb is a debug partition that LK rewrites on every
+# boot anyway, and erasing it guarantees that whatever we read back afterwards
+# belongs to this attempt only. Failure to erase is not fatal.
+if (-not $KeepExpdb) {
+    Say "erasing expdb (log reset) ..." Yellow
+    $rc = Fb-Run @("erase", "expdb")
+    if ($rc -ne 0) { Say "  erase expdb not supported here - continuing, log may be stale" DarkYellow }
+}
 
 # ------------------------------------------------------------------- flash
 $steps = @(
