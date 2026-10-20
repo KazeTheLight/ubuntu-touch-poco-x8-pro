@@ -108,13 +108,34 @@ Build in Actions
 
 1. Push to the fork `KazeTheLight/ubuntu-touch-poco-x8-pro` and run the **Build klee images**
    workflow.
-2. When it finishes, download and unzip these artifacts into `release/images/`:
+2. Download the artifacts into `release/images/`. The easy way is the helper script, which takes
+   the newest non-expired copy of each artifact no matter which run produced it:
+
+   ```
+   .\fetch-artifacts.ps1
+   ```
+
+   Or download them by hand and unzip into `release/images/`:
 
    | Artifact | File needed in `images/` |
    |---|---|
    | `klee-boot-images` | `ut_boot.img`, `ut_init_boot.img` |
    | `klee-rootfs` | `ubuntu.img` |
    | `klee-utdata` | `ut_data.img` |
+
+Retrying only part of the build
+-------------------------------
+
+The workflow has inputs so a failed rootfs / ut_data can be retried without rebuilding the
+kernel:
+
+| Input | Use |
+|---|---|
+| `build_kernel` | `false` skips the ~30 minute kernel build |
+| `kernel_run_id` | run ID to take `klee-modules` / `klee-boot-images` from |
+
+With `build_kernel=false` the two later jobs pull the kernel artifacts from `kernel_run_id`
+instead of rebuilding them.
 
 Install from Windows
 --------------------
