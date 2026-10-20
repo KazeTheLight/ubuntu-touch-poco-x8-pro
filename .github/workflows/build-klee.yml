@@ -403,25 +403,35 @@ jobs:
           # which needs privileges a job container does not reliably have.
           MNT="$WORK/system"
           rm -rf "$WORK/base" "$MNT"
-          mkdir -p "$WORK/base"
+          mkdir -p "$MNT"
           cd "$PORT"
 
-          # 1. Unpack the base rootfs ("system/" tree).
-          tar xzf "$HOME/klee-ut/downloads/out/rootfs.tar.gz" -C "$WORK/base" --numeric-owner
-          mv "$WORK/base/system" "$MNT"
-          rmdir "$WORK/base" 2>/dev/null || true
+          # 1. Unpack the base rootfs. The tarball puts everything under one
+          # top-level directory, so strip it instead of assuming the name
+          # ("system"). Everything after this point needs $MNT to be a real
+          # directory: when it was a symlink, `ln -s ... $MNT/lib` failed with
+          # ENOENT and the step died before the modules were copied.
+          tar xzf "$HOME/klee-ut/downloads/out/rootfs.tar.gz" -C "$MNT" \
+            --strip-components=1 --numeric-owner
+          echo "--- top of the unpacked rootfs ---"
+          ls -la "$MNT" | head -n 25
+          if [ ! -d "$MNT/usr" ] || [ ! -d "$MNT/etc" ]; then
+            echo "!! unexpected rootfs layout: no usr/ and etc/ at the top"
+            find "$MNT" -maxdepth 2 | head -n 40
+            exit 1
+          fi
 
           # 2. Replace the generic GKI modules with the klee ones.
-          # The base rootfs ships no module tree at all, so usr/lib/modules may
-          # not exist yet (cp then fails with "No such file or directory").
-          # Use /lib/modules unless /lib is the usrmerge symlink to usr/lib.
-          if [ -L "$MNT/lib" ]; then
+          # The base rootfs ships no module tree at all, so it has to be created.
+          # depmod -b looks in $MNT/lib/modules, which is $MNT/usr/lib/modules
+          # on a usrmerge system.
+          if [ -L "$MNT/lib" ] || [ -d "$MNT/usr/lib" ]; then
             MODDIR="$MNT/usr/lib/modules"
-          elif [ -d "$MNT/lib" ]; then
-            MODDIR="$MNT/lib/modules"
+            if [ ! -e "$MNT/lib" ] && [ ! -L "$MNT/lib" ]; then
+              ln -s usr/lib "$MNT/lib"
+            fi
           else
-            MODDIR="$MNT/usr/lib/modules"
-            ln -s usr/lib "$MNT/lib"
+            MODDIR="$MNT/lib/modules"
           fi
           mkdir -p "$MODDIR"
           rm -rf "$MODDIR"/*
