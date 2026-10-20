@@ -39,8 +39,9 @@ defaults:
     shell: bash
 
 env:
-  # All build scripts insist on a path without spaces; the container HOME is /root.
-  KLEE_UT: /root/klee-ut
+  # NOTE: build-klee.sh hardcodes "$HOME/klee-ut/...", and in a GitHub Actions
+  # container HOME is /github/home (not /root). Every path here is therefore
+  # derived from $HOME at run time rather than pinned to an absolute path.
   BASE_ROOTFS_URL: "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252F24.04-1.x/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz"
   # GitHub runners have no working IPv6 route. Force git to IPv4 too, not just
   # apt, or the clones fail the same way apt did.
@@ -86,8 +87,8 @@ jobs:
           echo "BASE_COMMIT=$BASE" >> "$GITHUB_ENV"
           git clone --depth 1 -b android15-6.6-halium \
             https://gitlab.com/ubports/porting/community-ports/android12/generic/kernel-android-common.git \
-            "$KLEE_UT/kernel"
-          cd "$KLEE_UT/kernel"
+            "$HOME/klee-ut/kernel"
+          cd "$HOME/klee-ut/kernel"
           git fetch --depth 1 origin "$BASE"
           git checkout "$BASE"
           git apply "$GITHUB_WORKSPACE/kernel/klee-kernel.patch"
@@ -98,50 +99,62 @@ jobs:
           set -euxo pipefail
           # setup_repositories.sh maps halium 15/16 to branch main-kernel-build-2024,
           # whose clang is r510928 - the same compiler as the stock kernel.
+          # build-klee.sh wants it at $HOME/klee-ut/toolchain/clang-r510928/bin.
           git clone --depth 1 -b main-kernel-build-2024 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            "$KLEE_UT/toolchain-clone"
-          mv "$KLEE_UT/toolchain-clone/clang-r510928" "$KLEE_UT/toolchain"
-          rm -rf "$KLEE_UT/toolchain-clone"
-          "$KLEE_UT/toolchain/bin/clang" --version | head -n1
+            "$HOME/klee-ut/toolchain-clone"
+          mkdir -p "$HOME/klee-ut/toolchain"
+          mv "$HOME/klee-ut/toolchain-clone/clang-r510928" "$HOME/klee-ut/toolchain/"
+          rm -rf "$HOME/klee-ut/toolchain-clone"
+          "$HOME/klee-ut/toolchain/clang-r510928/bin/clang" --version | head -n1
 
       - name: Prepare the port tree
         run: |
           set -euxo pipefail
-          cp -r "$GITHUB_WORKSPACE/port" "$KLEE_UT/ubports-klee"
-          cd "$KLEE_UT/ubports-klee"
+          cp -r "$GITHUB_WORKSPACE/port" "$HOME/klee-ut/ubports-klee"
+          cd "$HOME/klee-ut/ubports-klee"
           # build-klee.sh expects its own downloads dir and an OUT dir; the
           # rootfs is built by the other job, so only what the boot images need
           # has to exist here.
           mkdir -p workdir/downloads release/images
-          df -h "$KLEE_UT"
+          df -h "$HOME"
 
       - name: Build kernel and boot images
         run: |
           set -euxo pipefail
-          cd "$KLEE_UT/ubports-klee"
+          cd "$HOME/klee-ut/ubports-klee"
           # Pin the parallelism so a 4 vCPU runner does not swap itself to death.
           sed -i "s/-j\"\$(nproc)\"/-j${{ inputs.kernel_jobs }}/" build-klee.sh
           SKIP_ROOTFS=1 ./build-klee.sh
-          KREL="$(cat "$KLEE_UT/kout/include/config/kernel.release")"
+          KREL="$(cat "$HOME/klee-ut/kout/include/config/kernel.release")"
           echo "KREL=$KREL" >> "$GITHUB_ENV"
           echo "kernel release: $KREL"
-          # build-klee.sh writes to "$HOME/poco x8 pro ub touch/release/images"
-          ls -la "$HOME/poco x8 pro ub touch/release/images"
+          # build-klee.sh writes to "$HOME/poco x8 pro ub touch/release/images";
+          # copy the results somewhere upload-artifact can find without $HOME.
+          mkdir -p "$GITHUB_WORKSPACE/out/boot"
+          cp "$HOME/poco x8 pro ub touch/release/images/ut_boot.img" \
+             "$HOME/poco x8 pro ub touch/release/images/ut_init_boot.img" \
+             "$HOME/poco x8 pro ub touch/release/images/ut_boot_fastboot-boot.img" \
+             "$GITHUB_WORKSPACE/out/boot/"
+          # and the installed modules, needed by the rootfs job
+          mkdir -p "$GITHUB_WORKSPACE/out/modules"
+          cp -a "$HOME/klee-ut/work/modroot/lib/modules/." "$GITHUB_WORKSPACE/out/modules/"
+          ls -la "$GITHUB_WORKSPACE/out/boot"
+          du -sh "$GITHUB_WORKSPACE/out/modules"
 
       - name: Check module count
         run: |
           set -euxo pipefail
-          find "$KLEE_UT/work/modroot/lib/modules" -name '*.ko' | wc -l
+          find "$GITHUB_WORKSPACE/out/modules" -name '*.ko' | wc -l
 
       - name: Upload boot images
         uses: actions/upload-artifact@v4
         with:
           name: klee-boot-images
           path: |
-            /root/poco x8 pro ub touch/release/images/ut_boot.img
-            /root/poco x8 pro ub touch/release/images/ut_init_boot.img
-            /root/poco x8 pro ub touch/release/images/ut_boot_fastboot-boot.img
+            out/boot/ut_boot.img
+            out/boot/ut_init_boot.img
+            out/boot/ut_boot_fastboot-boot.img
           if-no-files-found: error
           retention-days: 14
 
@@ -149,7 +162,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: klee-modules
-          path: /root/klee-ut/work/modroot/lib/modules/
+          path: out/modules/
           if-no-files-found: error
           retention-days: 14
 
@@ -201,9 +214,9 @@ jobs:
       - name: Fetch the UT 24.04-1.x base rootfs
         run: |
           set -euxo pipefail
-          mkdir -p "$KLEE_UT/downloads/out"
-          curl -4 -L --fail --retry 3 -o "$KLEE_UT/downloads/out/rootfs.tar.gz" "$BASE_ROOTFS_URL"
-          ls -la "$KLEE_UT/downloads/out"
+          mkdir -p "$HOME/klee-ut/downloads/out"
+          curl -4 -L --fail --retry 3 -o "$HOME/klee-ut/downloads/out/rootfs.tar.gz" "$BASE_ROOTFS_URL"
+          ls -la "$HOME/klee-ut/downloads/out"
 
       - name: Assemble the rootfs image
         run: |
@@ -216,14 +229,14 @@ jobs:
           echo "modules for kernel release: $KREL"
 
           PORT="$GITHUB_WORKSPACE/port"
-          WORK="$KLEE_UT/work"
+          WORK="$HOME/klee-ut/work"
           MNT="$WORK/mnt"
           mkdir -p "$WORK" "$MNT"
           cd "$PORT"
 
           # 1. Unpack the base rootfs ("system/" tree) into a staging dir.
           mkdir -p "$WORK/base"
-          tar xzf "$KLEE_UT/downloads/out/rootfs.tar.gz" -C "$WORK/base" --numeric-owner
+          tar xzf "$HOME/klee-ut/downloads/out/rootfs.tar.gz" -C "$WORK/base" --numeric-owner
           mv "$WORK/base/system" "$WORK/system"
 
           # 2. ext4 image, sized like the sibling port (system_partition_size).
