@@ -227,12 +227,12 @@ jobs:
           cd "$HOME/klee-ut/kernel"
           # idempotent: re-running on a cached source tree must not double-apply
           if ! grep -q skip_encoding_btf_enum64 scripts/pahole-flags.sh; then
-            cat >> scripts/pahole-flags.sh <<'EOF'
-
-if [ "${pahole_ver}" -ge "124" ]; then
-	extra_paholeopt="${extra_paholeopt} --skip_encoding_btf_enum64"
-fi
-EOF
+            {
+              printf '\n'
+              printf 'if [ "${pahole_ver}" -ge "124" ]; then\n'
+              printf '\textra_paholeopt="${extra_paholeopt} --skip_encoding_btf_enum64"\n'
+              printf 'fi\n'
+            } >> scripts/pahole-flags.sh
           fi
           cat scripts/pahole-flags.sh
           # write the fallback config fragment next to the port's own config
