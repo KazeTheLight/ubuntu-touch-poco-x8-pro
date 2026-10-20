@@ -35,6 +35,11 @@ env:
   # All build scripts insist on a path without spaces; the container HOME is /root.
   KLEE_UT: /root/klee-ut
   BASE_ROOTFS_URL: "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252F24.04-1.x/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz"
+  # GitHub runners have no working IPv6 route. Force git to IPv4 too, not just
+  # apt, or the clones fail the same way apt did.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: "http.version"
+  GIT_CONFIG_VALUE_0: "HTTP/1.1"
 
 jobs:
   kernel:
@@ -50,6 +55,9 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euxo pipefail
+          # GitHub runners have no working IPv6 route; apt would otherwise burn
+          # its attempts on AAAA records and fail with "Network is unreachable".
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates cpio curl \
@@ -149,10 +157,13 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euxo pipefail
+          # See the kernel job: force IPv4, the runners have no IPv6 route.
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates cmake curl e2fsprogs git liblz4-dev libselinux1-dev \
             libtool-bin pkg-config sudo uuid-dev xz-utils zlib1g-dev
+          rm -rf /var/lib/apt/lists/*
           df -h /
 
       # Ubuntu 22.04's erofs-utils is 1.4; -E ztailpacking needs >= 1.6 and the
@@ -179,7 +190,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$KLEE_UT/downloads/out"
-          curl -L --fail --retry 3 -o "$KLEE_UT/downloads/out/rootfs.tar.gz" "$BASE_ROOTFS_URL"
+          curl -4 -L --fail --retry 3 -o "$KLEE_UT/downloads/out/rootfs.tar.gz" "$BASE_ROOTFS_URL"
           ls -la "$KLEE_UT/downloads/out"
 
       - name: Assemble the rootfs image
