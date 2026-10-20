@@ -66,9 +66,6 @@ env:
   BASE_ROOTFS_URL: "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252F24.04-1.x/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz"
   # Pinned so the cache key changes when the compiler does.
   CLANG_REV: "r510928"
-  # pahole >= 1.24 is required to read kernel 6.6 BTF. Jammy ships 1.22, which
-  # fails with "BTF header not found / load BTF from vmlinux: Invalid argument".
-  PAHOLE_VERSION: "v1.25"
   # GitHub runners have no working IPv6 route. Force git to IPv4 too, not just
   # apt, or the clones fail the same way apt did.
   GIT_CONFIG_COUNT: "1"
@@ -99,30 +96,21 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             bash bc bison build-essential ca-certificates cpio curl \
-            dwarves fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 \
-            lz4 python2 python3 sudo unzip wget xz-utils libbpf-dev
+            fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 \
+            lz4 pahole dwarves python2 python3 sudo unzip wget xz-utils libbpf-dev
           ln -sf /usr/bin/python2 /usr/bin/python
           rm -rf /var/lib/apt/lists/*
           python --version
           df -h /
-
-      # Jammy's pahole is 1.22, which cannot read the BTF of a 6.6 kernel:
-      #   libbpf: BTF header not found
-      #   FAILED: load BTF from vmlinux: Invalid argument
-      # Build 1.25 from source and put it ahead of /usr/bin. This step is cheap
-      # and its output is cached, so a resumed run does not rebuild it.
-      - name: Build pahole 1.25 (jammy's 1.22 cannot read 6.6 BTF)
-        run: |
-          set -euxo pipefail
-          dpkg --list dwarves >/dev/null 2>&1 && apt-get purge -y dwarves || true
-          git clone --depth 1 -b "$PAHOLE_VERSION" https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
-          cd /tmp/pahole
-          mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -D__LIB=lib ..
-          make -j"$(nproc)"
-          make install
-          hash -r
-          ldconfig
+          # Kernel 6.6 needs pahole >= 1.24 to read its BTF. Run 4 died with
+          #   libbpf: BTF header not found
+          #   FAILED: load BTF from vmlinux: Invalid argument
+          # because the resolved pahole was 1.22. jammy-updates now carries
+          # 1.25; fail loudly here instead of 20 minutes into the build if a
+          # future image pins an older one back.
+          PAHOLE_VER="$(pahole --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)"
+          echo "pahole version: ${PAHOLE_VER:-unknown}"
+          awk -v v="${PAHOLE_VER:-0}" 'BEGIN { if (v+0 < 1.24) { print "pahole too old for kernel 6.6 BTF (need >= 1.24)"; exit 1 } }'
           pahole --version
 
       - name: Compute cache keys
