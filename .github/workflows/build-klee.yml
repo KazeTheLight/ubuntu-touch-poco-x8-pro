@@ -1,16 +1,25 @@
 name: Build klee Ubuntu Touch images
 
-# Builds the three images the klee installer needs, split over two jobs so
-# neither runs into GitHub's 6 h per-job limit:
+# Builds everything the klee dual-boot installer needs, split over three jobs so
+# none of them hits GitHub's 6 h per-job limit:
 #
 #   job "kernel" -> ut_boot.img, ut_init_boot.img, ut_boot_fastboot-boot.img
 #                   + the installed modules tree (artifact)
-#   job "rootfs" -> ubuntu.img (EROFS), reusing the modules from job "kernel"
+#   job "rootfs" -> ubuntu.img (EROFS)
+#   job "utdata" -> ut_data.img (the ext4 image install.sh creates on the phone)
 #
 # Everything runs inside ubuntu:22.04 because the port's scripts need Python 2
 # (make-bootimage.sh -> python2 mkdtboimg.py) and libtinfo5, neither of which
 # exist on the ubuntu-22.04 runner image itself. This mirrors the upstream
 # GitLab CI (port/build/gsi-port-ci.yml), which uses ubuntu:22.04 the same way.
+#
+# RESUMING A FAILED BUILD
+# -----------------------
+# The heavy state (kernel source, clang, and the kernel object tree in kout) is
+# kept in the Actions cache. Re-running the workflow reuses it, so a build that
+# died at minute 200 does not start again from minute 0. The cache key embeds
+# BASE_COMMIT and the compiler revision, so changing either starts a clean tree
+# automatically instead of mixing incompatible objects.
 #
 # Note on EROFS: the installer expects a compressed EROFS image made with
 # `-zlz4hc,12 -E ztailpacking -C 65536`. Ubuntu 22.04 ships erofs-utils 1.4,
@@ -20,9 +29,21 @@ on:
   workflow_dispatch:
     inputs:
       build_rootfs:
-        description: "Also build ubuntu.img (requires the kernel job to succeed)"
+        description: "Also build ubuntu.img (EROFS rootfs)"
         type: boolean
         default: true
+      build_utdata:
+        description: "Also build ut_data.img (needed for a Windows install)"
+        type: boolean
+        default: true
+      use_cache:
+        description: "Reuse the cached kernel source / toolchain / object tree"
+        type: boolean
+        default: true
+      ut_data_mib:
+        description: "Size of ut_data.img in MiB (from the phone's lpdump; 3368 for this device)"
+        type: string
+        default: "3368"
       kernel_jobs:
         description: "Parallel make jobs for the kernel build"
         type: string
@@ -43,6 +64,11 @@ env:
   # container HOME is /github/home (not /root). Every path here is therefore
   # derived from $HOME at run time rather than pinned to an absolute path.
   BASE_ROOTFS_URL: "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252F24.04-1.x/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz"
+  # Pinned so the cache key changes when the compiler does.
+  CLANG_REV: "r510928"
+  # pahole >= 1.24 is required to read kernel 6.6 BTF. Jammy ships 1.22, which
+  # fails with "BTF header not found / load BTF from vmlinux: Invalid argument".
+  PAHOLE_VERSION: "v1.25"
   # GitHub runners have no working IPv6 route. Force git to IPv4 too, not just
   # apt, or the clones fail the same way apt did.
   GIT_CONFIG_COUNT: "1"
@@ -73,18 +99,64 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             bash bc bison build-essential ca-certificates cpio curl \
-            fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 lz4 \
-            python2 python3 sudo unzip wget xz-utils pahole libbpf-dev
+            dwarves fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 \
+            lz4 python2 python3 sudo unzip wget xz-utils libbpf-dev
           ln -sf /usr/bin/python2 /usr/bin/python
           rm -rf /var/lib/apt/lists/*
           python --version
           df -h /
 
-      - name: Clone the kernel and apply the klee patch
+      # Jammy's pahole is 1.22, which cannot read the BTF of a 6.6 kernel:
+      #   libbpf: BTF header not found
+      #   FAILED: load BTF from vmlinux: Invalid argument
+      # Build 1.25 from source and put it ahead of /usr/bin. This step is cheap
+      # and its output is cached, so a resumed run does not rebuild it.
+      - name: Build pahole 1.25 (jammy's 1.22 cannot read 6.6 BTF)
+        run: |
+          set -euxo pipefail
+          dpkg --list dwarves >/dev/null 2>&1 && apt-get purge -y dwarves || true
+          git clone --depth 1 -b "$PAHOLE_VERSION" https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+          cd /tmp/pahole
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -D__LIB=lib ..
+          make -j"$(nproc)"
+          make install
+          hash -r
+          ldconfig
+          pahole --version
+
+      - name: Compute cache keys
+        id: keys
         run: |
           set -euxo pipefail
           BASE="$(cut -d' ' -f1 kernel/BASE_COMMIT)"
-          echo "BASE_COMMIT=$BASE" >> "$GITHUB_ENV"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          # The kernel source and the compiler only depend on the pinned commit
+          # and the compiler revision, so they are stable across runs.
+          echo "src=klee-src-$BASE-${{ env.CLANG_REV }}" >> "$GITHUB_OUTPUT"
+          # The object tree additionally depends on the config and the patch, so
+          # a config change invalidates it instead of mixing objects.
+          CFG="$(sha256sum kernel/klee-kernel.patch port/klee.config | sha256sum | cut -c1-16)"
+          echo "kout=klee-kout-$BASE-${{ env.CLANG_REV }}-$CFG" >> "$GITHUB_OUTPUT"
+
+      # Kernel source tree: ~1.5 GB. Without this the clone costs a few minutes
+      # and 1.5 GB of traffic on every single run.
+      - name: Restore kernel source cache
+        if: ${{ inputs.use_cache }}
+        id: c-src
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /github/home/klee-ut/kernel
+            /github/home/klee-ut/toolchain
+          key: ${{ steps.keys.outputs.src }}
+
+      - name: Clone the kernel and apply the klee patch
+        if: ${{ steps.c-src.outputs.cache-hit != 'true' }}
+        run: |
+          set -euxo pipefail
+          BASE="${{ steps.keys.outputs.base }}"
+          rm -rf "$HOME/klee-ut/kernel"
           git clone --depth 1 -b android15-6.6-halium \
             https://gitlab.com/ubports/porting/community-ports/android12/generic/kernel-android-common.git \
             "$HOME/klee-ut/kernel"
@@ -94,30 +166,53 @@ jobs:
           git apply "$GITHUB_WORKSPACE/kernel/klee-kernel.patch"
           echo "kernel tree ready at commit $BASE"
 
-      - name: Fetch AOSP clang r510928
+      - name: Fetch AOSP clang ${{ env.CLANG_REV }}
+        if: ${{ steps.c-src.outputs.cache-hit != 'true' }}
         run: |
           set -euxo pipefail
           # setup_repositories.sh maps halium 15/16 to branch main-kernel-build-2024,
           # whose clang is r510928 - the same compiler as the stock kernel.
           # build-klee.sh wants it at $HOME/klee-ut/toolchain/clang-r510928/bin.
+          rm -rf "$HOME/klee-ut/toolchain-clone"
           git clone --depth 1 -b main-kernel-build-2024 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             "$HOME/klee-ut/toolchain-clone"
           mkdir -p "$HOME/klee-ut/toolchain"
-          mv "$HOME/klee-ut/toolchain-clone/clang-r510928" "$HOME/klee-ut/toolchain/"
+          rm -rf "$HOME/klee-ut/toolchain/clang-${{ env.CLANG_REV }}"
+          mv "$HOME/klee-ut/toolchain-clone/clang-${{ env.CLANG_REV }}" "$HOME/klee-ut/toolchain/"
           rm -rf "$HOME/klee-ut/toolchain-clone"
-          "$HOME/klee-ut/toolchain/clang-r510928/bin/clang" --version | head -n1
+          "$HOME/klee-ut/toolchain/clang-${{ env.CLANG_REV }}/bin/clang" --version | head -n1
+
+      - name: Save kernel source cache
+        if: ${{ inputs.use_cache && steps.c-src.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /github/home/klee-ut/kernel
+            /github/home/klee-ut/toolchain
+          key: ${{ steps.keys.outputs.src }}
 
       - name: Prepare the port tree
         run: |
           set -euxo pipefail
+          rm -rf "$HOME/klee-ut/ubports-klee"
           cp -r "$GITHUB_WORKSPACE/port" "$HOME/klee-ut/ubports-klee"
           cd "$HOME/klee-ut/ubports-klee"
-          # build-klee.sh expects its own downloads dir and an OUT dir; the
-          # rootfs is built by the other job, so only what the boot images need
-          # has to exist here.
+          # build-klee.sh expects its own downloads dir and an OUT dir.
           mkdir -p workdir/downloads release/images
           df -h "$HOME"
+
+      # The kernel object tree is the expensive part (~20-30 min, ~4 GB). If a
+      # previous run compiled objects before dying, restoring kout means make
+      # only rebuilds what actually failed.
+      - name: Restore kernel object cache
+        if: ${{ inputs.use_cache }}
+        id: c-kout
+        uses: actions/cache/restore@v4
+        with:
+          path: /github/home/klee-ut/kout
+          key: ${{ steps.keys.outputs.kout }}
 
       - name: Build kernel and boot images
         run: |
@@ -136,11 +231,21 @@ jobs:
              "$HOME/poco x8 pro ub touch/release/images/ut_init_boot.img" \
              "$HOME/poco x8 pro ub touch/release/images/ut_boot_fastboot-boot.img" \
              "$GITHUB_WORKSPACE/out/boot/"
-          # and the installed modules, needed by the rootfs job
+          # and the installed modules, needed by the rootfs + utdata jobs
           mkdir -p "$GITHUB_WORKSPACE/out/modules"
           cp -a "$HOME/klee-ut/work/modroot/lib/modules/." "$GITHUB_WORKSPACE/out/modules/"
           ls -la "$GITHUB_WORKSPACE/out/boot"
           du -sh "$GITHUB_WORKSPACE/out/modules"
+
+      # Save the object tree only after a successful build, so a failed run
+      # never poisons the cache with a half-written tree.
+      - name: Save kernel object cache
+        if: ${{ inputs.use_cache && success() }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /github/home/klee-ut/kout
+          key: ${{ steps.keys.outputs.kout }}
 
       - name: Check module count
         run: |
@@ -292,5 +397,103 @@ jobs:
         with:
           name: klee-rootfs
           path: release/images/ubuntu.img
+          if-no-files-found: error
+          retention-days: 14
+
+  # install.sh builds ut_data.img on Linux with debugfs/img2simg, which do not
+  # exist on Windows. Produce it here instead, so a Windows machine only needs
+  # adb + fastboot (both already in platform-tools) to install.
+  utdata:
+    name: ut_data.img for the Windows installer
+    needs: kernel
+    if: ${{ inputs.build_utdata }}
+    runs-on: ubuntu-22.04
+    container: ubuntu:22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        shell: sh
+        run: |
+          set -ex
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            android-sdk-libsparse-utils bash ca-certificates curl e2fsprogs git \
+            python3 sudo unzip wget xz-utils
+          rm -rf /var/lib/apt/lists/*
+          command -v img2simg
+          command -v mkfs.ext4
+          command -v debugfs
+
+      - name: Download the rootfs image
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-rootfs
+          path: release/images
+
+      # The real install.sh cannot run here: it drives adb/fastboot at a phone
+      # that does not exist, and it wants a live super partition to size ut_data
+      # from. This reproduces only its image-building half (steps 2b-4), with the
+      # ut_data size passed in from the phone's own lpdump (3368 MiB), and stops
+      # at the dry-run exit, exactly like `install.sh --dry-run`.
+      - name: Build ut_data.img
+        run: |
+          set -euxo pipefail
+          HERE="$GITHUB_WORKSPACE/release"
+          IMG="$HERE/images"
+          WORK="$HERE/work"
+          UT_MIB="${{ inputs.ut_data_mib }}"
+
+          for f in ut_boot.img ut_init_boot.img ubuntu.img; do
+            test -f "$IMG/$f" || { echo "missing $IMG/$f"; exit 1; }
+          done
+
+          mkdir -p "$WORK"
+          RAW="$WORK/ut_data.raw"
+          rm -f "$RAW" "$WORK/ut_data.img"
+          truncate -s "${UT_MIB}M" "$RAW"
+          # Halium's initramfs ships e2fsck 1.43: keep the feature set it knows.
+          mkfs.ext4 -q -F -L ut_data -b 4096 -m 0 \
+            -O ^metadata_csum,^metadata_csum_seed,^orphan_file "$RAW"
+
+          # debugfs cannot cope with spaces in paths; use a symlink farm.
+          L="$(mktemp -d /tmp/klee-ut.XXXXXX)"
+          ln -s "$IMG/ubuntu.img"            "$L/ubuntu.img"
+          ln -s "$IMG/ut_boot.img"           "$L/ut_boot.img"
+          ln -s "$IMG/ut_init_boot.img"      "$L/ut_init_boot.img"
+
+          # install.sh also writes the phone's own android boot backups here.
+          # Those are device-specific, so they are NOT baked in: the Windows
+          # installer writes them after taking its own backup. ut_data.img here
+          # therefore contains the rootfs and the UT boot images only.
+          {
+            echo "write $L/ubuntu.img ubuntu.img"
+            echo "mkdir klee-dualboot"
+            for f in ut_boot.img ut_init_boot.img; do
+              echo "write $L/$f klee-dualboot/$f"
+            done
+          } | debugfs -w -f - "$RAW" >/dev/null
+          rm -f "$L"/*; rmdir "$L"
+
+          for f in ubuntu.img klee-dualboot/ut_boot.img klee-dualboot/ut_init_boot.img; do
+            debugfs -R "stat $f" "$RAW" 2>/dev/null | grep -q 'Type: regular' \
+              || { echo "failed to write $f into ut_data"; exit 1; }
+          done
+          e2fsck -fn "$RAW" >/dev/null || { echo "ut_data image check failed"; exit 1; }
+          img2simg "$RAW" "$WORK/ut_data.img"
+          rm -f "$RAW"
+          ls -la "$WORK/ut_data.img"
+          mkdir -p "$HERE/images"
+          cp "$WORK/ut_data.img" "$HERE/images/ut_data.img"
+
+      - name: Upload ut_data image
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-utdata
+          path: release/images/ut_data.img
           if-no-files-found: error
           retention-days: 14
