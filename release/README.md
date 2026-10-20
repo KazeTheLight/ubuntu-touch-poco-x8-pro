@@ -9,8 +9,9 @@ With the dual boot install, Axion and your /data are **never wiped or formatted*
 logical partition (`ut_data`) in the free space of the super partition. Switching between the two
 systems only swaps the active slot's `boot` + `init_boot` images.
 
-The images are not in this repository. Build them with `port/build-klee.sh`; it writes them to
-`release/images/`.
+The images are not in this repository. On Linux, build them with `port/build-klee.sh`; it writes
+them to `release/images/`. On Windows, build them in GitHub Actions and download the artifacts
+(see [Installing from Windows](#installing-from-windows)).
 
 ## Contents
 
@@ -23,6 +24,9 @@ The images are not in this repository. Build them with `port/build-klee.sh`; it 
 | `install.sh` | Installer: takes backups, creates `ut_data`, writes the rootfs |
 | `boot-ubuntu.sh` / `boot-axion.sh` | Switch systems from the computer |
 | `device/to-ubuntu.sh` | Switch to Ubuntu from the phone (Axion, root) |
+| `install-windows.ps1` | Windows installer: same dual boot install, but uses the prebuilt `ut_data.img` |
+| `boot-ubuntu.ps1` | Switch to Ubuntu Touch from Windows |
+| `boot-android.ps1` | Switch back to Android from Windows |
 | `try-ubuntu-noflash.sh` | Experimental: tries to boot Ubuntu once without writing anything |
 | `collect-logs.sh` | Debug logs |
 | `uninstall.sh` | Removes the dual boot Ubuntu Touch completely |
@@ -91,6 +95,62 @@ if you ever go back to Android, check the modem/IMEI first.
 It flashes Android's `boot`/`init_boot` back and starts the recovery. There, choose **Format
 Data**, then reboot. Android starts with a fresh setup. The "Switch to Android" app inside Ubuntu
 Touch only works for the dual boot install.
+
+## Installing from Windows
+
+`install.sh` cannot run on Windows: it needs `mkfs.ext4`, `debugfs`, `e2fsck` and `img2simg`, none
+of which exist there. The PowerShell installer therefore works differently: the `ut_data` ext4
+image is built on Linux by the GitHub Actions workflow and downloaded as the `klee-utdata`
+artifact. Windows itself only needs `adb` and `fastboot`, which are already in `platform-tools`.
+
+Build in Actions
+----------------
+
+1. Push to the fork `KazeTheLight/ubuntu-touch-poco-x8-pro` and run the **Build klee images**
+   workflow.
+2. When it finishes, download and unzip these artifacts into `release/images/`:
+
+   | Artifact | File needed in `images/` |
+   |---|---|
+   | `klee-boot-images` | `ut_boot.img`, `ut_init_boot.img` |
+   | `klee-rootfs` | `ubuntu.img` |
+   | `klee-utdata` | `ut_data.img` |
+
+Install from Windows
+--------------------
+
+Start with the phone booted into Android, USB debugging on, and root granted to the **Shell** app
+in the KernelSU manager.
+
+1. Check everything first. This only takes backups and reads `super`; it changes nothing:
+   ```
+   .\install-windows.ps1 -DryRun
+   ```
+   It fails early if the phone is not `klee`, has no root, or has too little free space in
+   `super` (minimum 2560 MiB).
+2. Real install:
+   ```
+   .\install-windows.ps1
+   ```
+   It backs up the phone, reboots to `fastbootd`, creates `ut_data` in the free space of `super`,
+   flashes it, and returns to Android.
+
+   Backups go to `backup-<date>/`, with `backup-latest` pointing at the newest. **Do not delete
+   them** — you need them to return to Android.
+
+The size of `ut_data` is detected automatically (the free space in `super`, capped at 6144 MiB).
+Pass `-UtDataMib <n>` to override it; use the same value the `ut_data.img` artifact was built
+with.
+
+Switching systems
+-----------------
+
+- **To Ubuntu:** `.\boot-ubuntu.ps1`, or on the phone as root:
+  `su -c sh /sdcard/klee-ut/to-ubuntu.sh`.
+- **Back to Android:** `.\boot-android.ps1`.
+
+Both need the phone reachable, either over adb or already in bootloader fastboot
+(Volume Down + Power).
 
 ## Switching systems
 
