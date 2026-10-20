@@ -256,8 +256,19 @@ INIT_BOOT_IMAGE=""
 if [ "$deviceinfo_bootimg_header_version" -le 2 ]; then
     EXTRA_ARGS+=" --base $deviceinfo_flash_offset_base --kernel_offset $deviceinfo_flash_offset_kernel --ramdisk_offset $deviceinfo_flash_offset_ramdisk --second_offset $deviceinfo_flash_offset_second --tags_offset $deviceinfo_flash_offset_tags --pagesize $deviceinfo_flash_pagesize"
 else
-    EXTRA_VENDOR_ARGS+=" --base $deviceinfo_flash_offset_base --kernel_offset $deviceinfo_flash_offset_kernel --ramdisk_offset $deviceinfo_flash_offset_ramdisk --tags_offset $deviceinfo_flash_offset_tags --pagesize $deviceinfo_flash_pagesize --dtb_offset $deviceinfo_flash_offset_dtb"
-    EXTRA_VENDOR_KERNEL_ARGS+=" --dtb $DTB"
+    # klee's deviceinfo only sets deviceinfo_flash_pagesize; everything else is
+    # empty. Appending " --base " with no value makes mkbootimg abort with
+    # "argument --base: expected one argument", so only pass what exists.
+    if [ -n "$deviceinfo_flash_offset_base" ];    then EXTRA_VENDOR_ARGS+=" --base $deviceinfo_flash_offset_base"; fi
+    if [ -n "$deviceinfo_flash_offset_kernel" ];  then EXTRA_VENDOR_ARGS+=" --kernel_offset $deviceinfo_flash_offset_kernel"; fi
+    if [ -n "$deviceinfo_flash_offset_ramdisk" ]; then EXTRA_VENDOR_ARGS+=" --ramdisk_offset $deviceinfo_flash_offset_ramdisk"; fi
+    if [ -n "$deviceinfo_flash_offset_tags" ];    then EXTRA_VENDOR_ARGS+=" --tags_offset $deviceinfo_flash_offset_tags"; fi
+    if [ -n "$deviceinfo_flash_pagesize" ];       then EXTRA_VENDOR_ARGS+=" --pagesize $deviceinfo_flash_pagesize"; fi
+    if [ -n "$deviceinfo_flash_offset_dtb" ];     then EXTRA_VENDOR_ARGS+=" --dtb_offset $deviceinfo_flash_offset_dtb"; fi
+    # GKI 2.0: the klee bootloader passes its own DTB (lk_main_dtb + dtbo), and
+    # the kernel tree ships no vendor dtb, so --dtb must be omitted when empty
+    # (an empty value aborts mkbootimg).
+    if [ -n "$DTB" ]; then EXTRA_VENDOR_KERNEL_ARGS+=" --dtb $DTB"; fi
 fi
 
 if [ "$deviceinfo_bootimg_header_version" -eq 4 ]; then
