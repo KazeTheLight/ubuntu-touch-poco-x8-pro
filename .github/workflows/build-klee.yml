@@ -323,14 +323,16 @@ jobs:
           printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
-            autoconf automake bash ca-certificates cmake curl e2fsprogs git kmod \
-            liblz4-dev libselinux1-dev libtool libtool-bin pkg-config sudo \
-            uuid-dev xz-utils zlib1g-dev
+            autoconf automake bash build-essential ca-certificates cmake curl \
+            e2fsprogs git kmod liblz4-dev libselinux1-dev libtool libtool-bin \
+            pkg-config sudo uuid-dev xz-utils zlib1g-dev
           rm -rf /var/lib/apt/lists/*
           df -h /
           # erofs-utils' ./autogen.sh needs these; missing aclocal failed with
           #   ./autogen.sh: 4: aclocal: not found
-          command -v aclocal autoheader autoreconf libtoolize
+          # and a missing make made ./configure die with
+          #   config.status: error: Something went wrong bootstrapping makefile
+          command -v aclocal autoheader autoreconf libtoolize make gcc
 
       # Ubuntu 22.04's erofs-utils is 1.4; -E ztailpacking needs >= 1.6 and the
       # 64K pcluster size (-C 65536) needs >= 1.5. Build 1.7.1 ourselves.
