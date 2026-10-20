@@ -18,6 +18,17 @@ deviceinfo_ramdisk_compression="lz4"
 deviceinfo_flash_pagesize="4096"
 deviceinfo_bootimg_qcdt="false"
 deviceinfo_bootimg_header_version="4"
+# vendor_boot must describe the same load addresses the stock image uses; the
+# MTK LK takes them from this header (kernel@0x40000000, ramdisk@0x66f00000,
+# tags/dtb@0x47c80000). Without them LK built the image for 0x10008000 and the
+# boot died before it could even log "booting linux".
+deviceinfo_flash_offset_base="0x40000000"
+deviceinfo_flash_offset_kernel="0x00000000"
+deviceinfo_flash_offset_ramdisk="0x26f00000"
+deviceinfo_flash_offset_tags="0x07c80000"
+deviceinfo_flash_offset_dtb="0x07c80000"
+# platform DTB taken verbatim from the stock vendor_boot (mkimg header + FDT)
+deviceinfo_bootimg_prebuilt_dtb="prebuilt_dtb.img"
 # klee: boot 64 MiB, init_boot 8 MiB
 deviceinfo_bootimg_partition_size="67108864"
 deviceinfo_init_boot_partition_size="8388608"
