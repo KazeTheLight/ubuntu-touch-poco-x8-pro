@@ -1,0 +1,260 @@
+name: Build klee Ubuntu Touch images
+
+# Builds the three images the klee installer needs, split over two jobs so
+# neither runs into GitHub's 6 h per-job limit:
+#
+#   job "kernel" -> ut_boot.img, ut_init_boot.img, ut_boot_fastboot-boot.img
+#                   + the installed modules tree (artifact)
+#   job "rootfs" -> ubuntu.img (EROFS), reusing the modules from job "kernel"
+#
+# Everything runs inside ubuntu:22.04 because the port's scripts need Python 2
+# (make-bootimage.sh -> python2 mkdtboimg.py) and libtinfo5, neither of which
+# exist on the ubuntu-22.04 runner image itself. This mirrors the upstream
+# GitLab CI (port/build/gsi-port-ci.yml), which uses ubuntu:22.04 the same way.
+#
+# Note on EROFS: the installer expects a compressed EROFS image made with
+# `-zlz4hc,12 -E ztailpacking -C 65536`. Ubuntu 22.04 ships erofs-utils 1.4,
+# which is far too old for that, so the rootfs job builds erofs-utils from source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_rootfs:
+        description: "Also build ubuntu.img (requires the kernel job to succeed)"
+        type: boolean
+        default: true
+      kernel_jobs:
+        description: "Parallel make jobs for the kernel build"
+        type: string
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  # All build scripts insist on a path without spaces; the container HOME is /root.
+  KLEE_UT: /root/klee-ut
+  BASE_ROOTFS_URL: "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252F24.04-1.x/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz"
+
+jobs:
+  kernel:
+    name: Kernel + boot images
+    runs-on: ubuntu-22.04
+    container: ubuntu:22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl \
+            fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 lz4 \
+            python2 python3 sudo unzip wget xz-utils pahole libbpf-dev
+          ln -sf /usr/bin/python2 /usr/bin/python
+          rm -rf /var/lib/apt/lists/*
+          python --version
+          df -h /
+
+      - name: Clone the kernel and apply the klee patch
+        run: |
+          set -euxo pipefail
+          BASE="$(cut -d' ' -f1 kernel/BASE_COMMIT)"
+          echo "BASE_COMMIT=$BASE" >> "$GITHUB_ENV"
+          git clone --depth 1 -b android15-6.6-halium \
+            https://gitlab.com/ubports/porting/community-ports/android12/generic/kernel-android-common.git \
+            "$KLEE_UT/kernel"
+          cd "$KLEE_UT/kernel"
+          git fetch --depth 1 origin "$BASE"
+          git checkout "$BASE"
+          git apply "$GITHUB_WORKSPACE/kernel/klee-kernel.patch"
+          echo "kernel tree ready at commit $BASE"
+
+      - name: Fetch AOSP clang r510928
+        run: |
+          set -euxo pipefail
+          # setup_repositories.sh maps halium 15/16 to branch main-kernel-build-2024,
+          # whose clang is r510928 - the same compiler as the stock kernel.
+          git clone --depth 1 -b main-kernel-build-2024 \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            "$KLEE_UT/toolchain-clone"
+          mv "$KLEE_UT/toolchain-clone/clang-r510928" "$KLEE_UT/toolchain"
+          rm -rf "$KLEE_UT/toolchain-clone"
+          "$KLEE_UT/toolchain/bin/clang" --version | head -n1
+
+      - name: Prepare the port tree
+        run: |
+          set -euxo pipefail
+          cp -r "$GITHUB_WORKSPACE/port" "$KLEE_UT/ubports-klee"
+          cd "$KLEE_UT/ubports-klee"
+          # build-klee.sh expects its own downloads dir and an OUT dir; the
+          # rootfs is built by the other job, so only what the boot images need
+          # has to exist here.
+          mkdir -p workdir/downloads release/images
+          df -h "$KLEE_UT"
+
+      - name: Build kernel and boot images
+        run: |
+          set -euxo pipefail
+          cd "$KLEE_UT/ubports-klee"
+          # Pin the parallelism so a 4 vCPU runner does not swap itself to death.
+          sed -i "s/-j\"\$(nproc)\"/-j${{ inputs.kernel_jobs }}/" build-klee.sh
+          SKIP_ROOTFS=1 ./build-klee.sh
+          KREL="$(cat "$KLEE_UT/kout/include/config/kernel.release")"
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+          echo "kernel release: $KREL"
+          # build-klee.sh writes to "$HOME/poco x8 pro ub touch/release/images"
+          ls -la "$HOME/poco x8 pro ub touch/release/images"
+
+      - name: Check module count
+        run: |
+          set -euxo pipefail
+          find "$KLEE_UT/work/modroot/lib/modules" -name '*.ko' | wc -l
+
+      - name: Upload boot images
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-boot-images
+          path: |
+            /root/poco x8 pro ub touch/release/images/ut_boot.img
+            /root/poco x8 pro ub touch/release/images/ut_init_boot.img
+            /root/poco x8 pro ub touch/release/images/ut_boot_fastboot-boot.img
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload installed modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-modules
+          path: /root/klee-ut/work/modroot/lib/modules/
+          if-no-files-found: error
+          retention-days: 14
+
+  rootfs:
+    name: Ubuntu Touch rootfs (ubuntu.img)
+    needs: kernel
+    if: ${{ inputs.build_rootfs }}
+    runs-on: ubuntu-22.04
+    container: ubuntu:22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates cmake curl e2fsprogs git liblz4-dev libselinux1-dev \
+            libtool-bin pkg-config sudo uuid-dev xz-utils zlib1g-dev
+          df -h /
+
+      # Ubuntu 22.04's erofs-utils is 1.4; -E ztailpacking needs >= 1.6 and the
+      # 64K pcluster size (-C 65536) needs >= 1.5. Build 1.7.1 ourselves.
+      # Use the GitHub mirror: git.infradead.org is behind bot protection.
+      - name: Build erofs-utils from source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 -b v1.7.1 https://github.com/erofs/erofs-utils.git /tmp/erofs
+          cd /tmp/erofs
+          ./autogen.sh
+          ./configure --prefix=/usr --enable-lz4
+          make -j"$(nproc)"
+          make install
+          mkfs.erofs --version
+
+      - name: Download the kernel modules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-modules
+          path: /tmp/klee-modules
+
+      - name: Fetch the UT 24.04-1.x base rootfs
+        run: |
+          set -euxo pipefail
+          mkdir -p "$KLEE_UT/downloads/out"
+          curl -L --fail --retry 3 -o "$KLEE_UT/downloads/out/rootfs.tar.gz" "$BASE_ROOTFS_URL"
+          ls -la "$KLEE_UT/downloads/out"
+
+      - name: Assemble the rootfs image
+        run: |
+          set -euxo pipefail
+          # KREL is the single entry in the modules artifact; recover it and
+          # sanity-check that exactly one module tree was uploaded.
+          KREL="$(find /tmp/klee-modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -n1)"
+          test -n "$KREL"
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+          echo "modules for kernel release: $KREL"
+
+          PORT="$GITHUB_WORKSPACE/port"
+          WORK="$KLEE_UT/work"
+          MNT="$WORK/mnt"
+          mkdir -p "$WORK" "$MNT"
+          cd "$PORT"
+
+          # 1. Unpack the base rootfs ("system/" tree) into a staging dir.
+          mkdir -p "$WORK/base"
+          tar xzf "$KLEE_UT/downloads/out/rootfs.tar.gz" -C "$WORK/base" --numeric-owner
+          mv "$WORK/base/system" "$WORK/system"
+
+          # 2. ext4 image, sized like the sibling port (system_partition_size).
+          #    metadata_csum/orphan_file are disabled: the initrd's e2fsck is 1.43.
+          IMG="$WORK/ubuntu.img"
+          rm -f "$IMG"
+          truncate -s 3584M "$IMG"
+          mkfs.ext4 -q -F -O ^metadata_csum,^orphan_file "$IMG"
+          sudo mount -o loop "$IMG" "$MNT"
+
+          # 3. Install the opaque rootfs content.
+          sudo cp -a "$WORK/system/." "$MNT/"
+
+          # 4. Replace the generic GKI modules with the klee ones.
+          sudo rm -rf "$MNT"/usr/lib/modules/*
+          sudo cp -a "/tmp/klee-modules/$KREL" "$MNT/usr/lib/modules/"
+          sudo chown -R root:root "$MNT/usr/lib/modules"
+          sudo depmod -b "$MNT" "$KREL"
+
+          # 5. klee device overlay + rootfs patches (same order as build-klee.sh).
+          sudo rm -rf "$MNT/usr/lib/modules"/*/build "$MNT/usr/lib/modules"/*/source
+          sudo cp -a --no-preserve=ownership "$PORT/overlay/system/." "$MNT/"
+          sudo chown -R root:root "$MNT/usr/libexec/lxc-android-config" "$MNT/etc/deviceinfo"
+          # glob only if it matches something, otherwise chown fails on the literal
+          if compgen -G "$MNT/usr/bin/klee-*" >/dev/null; then
+            sudo chown -R root:root "$MNT/usr/bin/klee-"*
+          fi
+          for p in "$PORT"/rootfs-patches/*.sh; do
+            echo "applying rootfs patch: $p"
+            sudo bash "$p" "$MNT"
+          done
+          echo "klee $(date -u +%Y%m%d-%H%M)" | sudo tee "$MNT/etc/klee-port-version" >/dev/null
+
+          sync
+          sudo umount "$MNT"
+          e2fsck -fy "$IMG" >/dev/null || true
+
+          # 6. Ship the rootfs as compressed EROFS (3.5 GiB ext4 -> ~1.2 GiB)
+          #    so it fits, with user data, into the free space in super.
+          sudo mount -o loop,ro "$IMG" "$MNT"
+          rm -f "$WORK/ubuntu.erofs"
+          sudo mkfs.erofs -zlz4hc,12 -E ztailpacking -C 65536 "$WORK/ubuntu.erofs" "$MNT" >/dev/null
+          sudo umount "$MNT"
+          sudo chown "$(id -u):$(id -g)" "$WORK/ubuntu.erofs"
+
+          OUT="$GITHUB_WORKSPACE/release/images"
+          mkdir -p "$OUT"
+          cp "$WORK/ubuntu.erofs" "$OUT/ubuntu.img"
+          ls -la "$OUT/ubuntu.img"
+
+      - name: Upload rootfs image
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-rootfs
+          path: release/images/ubuntu.img
+          if-no-files-found: error
+          retention-days: 14
