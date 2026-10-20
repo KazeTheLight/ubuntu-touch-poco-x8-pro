@@ -31,6 +31,13 @@ on:
 permissions:
   contents: read
 
+# ubuntu:22.04 ships without bash, and GitHub Actions then runs steps with `sh`
+# (dash), where `set -o pipefail` is fatal. Every job installs bash in its first
+# step; all later steps use it.
+defaults:
+  run:
+    shell: bash
+
 env:
   # All build scripts insist on a path without spaces; the container HOME is /root.
   KLEE_UT: /root/klee-ut
@@ -52,15 +59,19 @@ jobs:
         with:
           fetch-depth: 1
 
+      # ubuntu:22.04 has no bash, so GitHub Actions falls back to `sh` (dash),
+      # where `set -o pipefail` is a fatal error. This first step must therefore
+      # run under plain sh; bash is installed for every step after it.
       - name: Install build dependencies
+        shell: sh
         run: |
-          set -euxo pipefail
+          set -ex
           # GitHub runners have no working IPv6 route; apt would otherwise burn
           # its attempts on AAAA records and fail with "Network is unreachable".
           printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates cpio curl \
+            bash bc bison build-essential ca-certificates cpio curl \
             fakeroot flex git kmod libelf-dev libssl-dev libtinfo5 lz4 \
             python2 python3 sudo unzip wget xz-utils pahole libbpf-dev
           ln -sf /usr/bin/python2 /usr/bin/python
@@ -155,13 +166,14 @@ jobs:
           fetch-depth: 1
 
       - name: Install build dependencies
+        shell: sh
         run: |
-          set -euxo pipefail
-          # See the kernel job: force IPv4, the runners have no IPv6 route.
+          set -ex
+          # See the kernel job: no bash in ubuntu:22.04, and no IPv6 route.
           printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates cmake curl e2fsprogs git liblz4-dev libselinux1-dev \
+            bash ca-certificates cmake curl e2fsprogs git liblz4-dev libselinux1-dev \
             libtool-bin pkg-config sudo uuid-dev xz-utils zlib1g-dev
           rm -rf /var/lib/apt/lists/*
           df -h /
