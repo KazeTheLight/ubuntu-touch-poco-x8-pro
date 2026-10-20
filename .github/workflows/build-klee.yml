@@ -325,14 +325,15 @@ jobs:
           apt-get install -y --no-install-recommends \
             autoconf automake bash build-essential ca-certificates cmake curl \
             e2fsprogs git kmod liblz4-dev libselinux1-dev libtool libtool-bin \
-            pkg-config sudo uuid-dev xz-utils zlib1g-dev
+            pkg-config python3 sudo uuid-dev xz-utils zlib1g-dev
           rm -rf /var/lib/apt/lists/*
           df -h /
           # erofs-utils' ./autogen.sh needs these; missing aclocal failed with
           #   ./autogen.sh: 4: aclocal: not found
           # and a missing make made ./configure die with
           #   config.status: error: Something went wrong bootstrapping makefile
-          command -v aclocal autoheader autoreconf libtoolize make gcc
+          # python3 is required by port/rootfs-patches/lomiri-klee.sh.
+          command -v aclocal autoheader autoreconf libtoolize make gcc python3
 
       # Ubuntu 22.04's erofs-utils is 1.4; -E ztailpacking needs >= 1.6 and the
       # 64K pcluster size (-C 65536) needs >= 1.5. Build 1.7.1 ourselves.
@@ -411,15 +412,32 @@ jobs:
           rmdir "$WORK/base" 2>/dev/null || true
 
           # 2. Replace the generic GKI modules with the klee ones.
-          rm -rf "$MNT"/usr/lib/modules/*
-          cp -a "/tmp/klee-modules/$KREL" "$MNT/usr/lib/modules/"
-          chown -R root:root "$MNT/usr/lib/modules"
+          # The base rootfs ships no module tree at all, so usr/lib/modules may
+          # not exist yet (cp then fails with "No such file or directory").
+          # Use /lib/modules unless /lib is the usrmerge symlink to usr/lib.
+          if [ -L "$MNT/lib" ]; then
+            MODDIR="$MNT/usr/lib/modules"
+          elif [ -d "$MNT/lib" ]; then
+            MODDIR="$MNT/lib/modules"
+          else
+            MODDIR="$MNT/usr/lib/modules"
+            ln -s usr/lib "$MNT/lib"
+          fi
+          mkdir -p "$MODDIR"
+          rm -rf "$MODDIR"/*
+          cp -a "/tmp/klee-modules/$KREL" "$MODDIR/"
+          chown -R root:root "$MODDIR"
           depmod -b "$MNT" "$KREL"
+          echo "modules installed into $MODDIR/$KREL"
 
           # 3. klee device overlay + rootfs patches (same order as build-klee.sh).
-          rm -rf "$MNT/usr/lib/modules"/*/build "$MNT/usr/lib/modules"/*/source
+          rm -rf "$MODDIR"/*/build "$MODDIR"/*/source
           cp -a --no-preserve=ownership "$PORT/overlay/system/." "$MNT/"
-          chown -R root:root "$MNT/usr/libexec/lxc-android-config" "$MNT/etc/deviceinfo"
+          # chown -R aborts the step under set -e if a path is absent
+          for d in "$MNT/usr/libexec/lxc-android-config" "$MNT/etc/deviceinfo"; do
+            [ -e "$d" ] || { echo "note: $d does not exist, skipped chown"; continue; }
+            chown -R root:root "$d"
+          done
           # glob only if it matches something, otherwise chown fails on the literal
           if compgen -G "$MNT/usr/bin/klee-*" >/dev/null; then
             chown -R root:root "$MNT/usr/bin/klee-"*
