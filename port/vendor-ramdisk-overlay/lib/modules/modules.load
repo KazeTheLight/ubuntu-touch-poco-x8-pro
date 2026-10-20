@@ -1,3 +1,5 @@
-ufs-mediatek.ko
-ufshcd-pltfrm.ko
+phy-mtk-ufs.ko
+reset-ti-syscon.ko
 ufshcd-core.ko
+ufshcd-pltfrm.ko
+ufs-mediatek.ko
