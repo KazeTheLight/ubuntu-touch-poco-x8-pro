@@ -202,13 +202,81 @@ jobs:
           path: /github/home/klee-ut/kout
           key: ${{ steps.keys.outputs.kout }}
 
+      # The BTF step is the one thing that has repeatedly killed this build:
+      #
+      #   LD      .tmp_vmlinux.btf
+      #   BTF     .btf.vmlinux.bin.o
+      #   libbpf: BTF header not found
+      #   pahole: .tmp_vmlinux.btf: Invalid argument
+      #   FAILED: load BTF from vmlinux: Invalid argument
+      #
+      # It is not a pahole-version problem: run 4 had pahole 1.22 and run 6 had
+      # 1.25, and both died the same way. The kernel's own scripts/pahole-flags.sh
+      # only knows flags up to about pahole 1.25 and never passes
+      # --skip_encoding_btf_enum64, while gki_defconfig turns on LTO + CFI, which
+      # is exactly the combination that breaks resolve_btfids.
+      #
+      # Two layers of defence, cheapest first:
+      #   1. teach pahole-flags.sh the enum64 flag
+      #   2. if BTF still fails, rebuild with CONFIG_DEBUG_INFO_BTF=n
+      # BTF is only needed for eBPF. Nothing in a Halium boot image needs it, so
+      # losing it costs nothing that this port does not already lack.
+      - name: Patch pahole flags for kernel 6.6 BTF
+        run: |
+          set -euxo pipefail
+          cd "$HOME/klee-ut/kernel"
+          # idempotent: re-running on a cached source tree must not double-apply
+          if ! grep -q skip_encoding_btf_enum64 scripts/pahole-flags.sh; then
+            cat >> scripts/pahole-flags.sh <<'EOF'
+
+if [ "${pahole_ver}" -ge "124" ]; then
+	extra_paholeopt="${extra_paholeopt} --skip_encoding_btf_enum64"
+fi
+EOF
+          fi
+          cat scripts/pahole-flags.sh
+          # write the fallback config fragment next to the port's own config
+          printf 'CONFIG_DEBUG_INFO_BTF=n\nCONFIG_DEBUG_INFO_BTF_MODULES=n\n' \
+            > "$HOME/klee-ut/ubports-klee/pahole-fallback.config"
+
       - name: Build kernel and boot images
+        id: build
+        continue-on-error: true
         run: |
           set -euxo pipefail
           cd "$HOME/klee-ut/ubports-klee"
           # Pin the parallelism so a 4 vCPU runner does not swap itself to death.
           sed -i "s/-j\"\$(nproc)\"/-j${{ inputs.kernel_jobs }}/" build-klee.sh
+          # Keep the log: the retry step inspects it to tell a BTF failure from
+          # any other one, so an unrelated failure is not retried blindly.
+          set -o pipefail
+          SKIP_ROOTFS=1 ./build-klee.sh 2>&1 | tee "$HOME/klee-ut/build1.log"
+
+      # If the first attempt died in the BTF step, disable BTF and run again.
+      # kout already holds every compiled object, so this second pass is short:
+      # it re-links vmlinux and finishes the remaining steps.
+      - name: Retry with BTF disabled (only for a BTF failure)
+        if: ${{ steps.build.outcome == 'failure' }}
+        run: |
+          set -euxo pipefail
+          if ! grep -qE 'load BTF from vmlinux|BTF header not found' "$HOME/klee-ut/build1.log"; then
+            echo "::error::the build failed, but not in the BTF step - not retrying blindly"
+            tail -n 40 "$HOME/klee-ut/build1.log"
+            exit 1
+          fi
+          echo "BTF failure detected, rebuilding with CONFIG_DEBUG_INFO_BTF=n"
+          cd "$HOME/klee-ut/ubports-klee"
+          if ! grep -q "DEBUG_INFO_BTF" klee.config; then
+            cat pahole-fallback.config >> klee.config
+          fi
+          grep -i btf klee.config || true
+          # make cannot see a config change in a stale kout, force a resync
+          rm -f "$HOME/klee-ut/kout/.config.old"
           SKIP_ROOTFS=1 ./build-klee.sh
+
+      - name: Collect the build outputs
+        run: |
+          set -euxo pipefail
           KREL="$(cat "$HOME/klee-ut/kout/include/config/kernel.release")"
           echo "KREL=$KREL" >> "$GITHUB_ENV"
           echo "kernel release: $KREL"
@@ -224,6 +292,15 @@ jobs:
           cp -a "$HOME/klee-ut/work/modroot/lib/modules/." "$GITHUB_WORKSPACE/out/modules/"
           ls -la "$GITHUB_WORKSPACE/out/boot"
           du -sh "$GITHUB_WORKSPACE/out/modules"
+
+      - name: Report which configuration produced the images
+        run: |
+          set -euxo pipefail
+          if grep -qE '^(# )?CONFIG_DEBUG_INFO_BTF=y' "$HOME/klee-ut/kout/.config"; then
+            echo "::notice::built WITH BTF (pahole-flags patch was enough)"
+          else
+            echo "::warning::built WITHOUT BTF (the pahole-flags patch was not enough; eBPF tracing will be unavailable on the device)"
+          fi
 
       # Save the object tree only after a successful build, so a failed run
       # never poisons the cache with a half-written tree.
