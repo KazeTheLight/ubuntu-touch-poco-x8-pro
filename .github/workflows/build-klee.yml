@@ -26,31 +26,42 @@ name: Build klee Ubuntu Touch images
 # which is far too old for that, so the rootfs job builds erofs-utils from source.
 
 on:
-  # workflow_dispatch:
-  #   inputs:
-  #     build_rootfs:
-  #       description: "Also build ubuntu.img (EROFS rootfs)"
-  #       type: boolean
-  #       default: true
-  #     build_utdata:
-  #       description: "Also build ut_data.img (needed for a Windows install)"
-  #       type: boolean
-  #       default: true
-  #     use_cache:
-  #       description: "Reuse the cached kernel source / toolchain / object tree"
-  #       type: boolean
-  #       default: true
-  #     ut_data_mib:
-  #       description: "Size of ut_data.img in MiB (from the phone's lpdump; 3368 for this device)"
-  #       type: string
-  #       default: "3368"
-  #     kernel_jobs:
-  #       description: "Parallel make jobs for the kernel build"
-  #       type: string
-  #       default: "4"
+  # Manual only: a push must not start a 30 minute kernel build.
+  workflow_dispatch:
+    inputs:
+      build_kernel:
+        description: "Build the kernel + boot images (slow, reuses the object cache)"
+        type: boolean
+        default: false
+      kernel_run_id:
+        description: "Run ID to take klee-modules / klee-boot-images from. Empty = this run."
+        type: string
+        default: "39363143096"
+      build_rootfs:
+        description: "Build ubuntu.img (EROFS rootfs)"
+        type: boolean
+        default: true
+      build_utdata:
+        description: "Build ut_data.img (needed for a Windows install)"
+        type: boolean
+        default: true
+      use_cache:
+        description: "Reuse the cached kernel source / toolchain / object tree"
+        type: boolean
+        default: true
+      ut_data_mib:
+        description: "Size of ut_data.img in MiB (from the phone's lpdump; 3368 for this device)"
+        type: string
+        default: "3368"
+      kernel_jobs:
+        description: "Parallel make jobs for the kernel build"
+        type: string
+        default: "4"
 
 permissions:
   contents: read
+  # needed to download artifacts from an earlier run (kernel_run_id)
+  actions: read
 
 # ubuntu:22.04 ships without bash, and GitHub Actions then runs steps with `sh`
 # (dash), where `set -o pipefail` is fatal. Every job installs bash in its first
@@ -75,6 +86,9 @@ env:
 jobs:
   kernel:
     name: Kernel + boot images
+    # Skipped on purpose when retrying only the rootfs / ut_data jobs: those
+    # pull the kernel artifacts from `kernel_run_id` instead of rebuilding.
+    if: ${{ inputs.build_kernel }}
     runs-on: ubuntu-22.04
     container: ubuntu:22.04
     timeout-minutes: 350
@@ -290,7 +304,9 @@ jobs:
   rootfs:
     name: Ubuntu Touch rootfs (ubuntu.img)
     needs: kernel
-    if: ${{ inputs.build_rootfs }}
+    # always(): the kernel job is deliberately skipped on a retry, and without
+    # it GitHub would skip this job too.
+    if: ${{ always() && inputs.build_rootfs && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
     runs-on: ubuntu-22.04
     container: ubuntu:22.04
     timeout-minutes: 350
@@ -307,10 +323,14 @@ jobs:
           printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-ci-network
           apt-get update
           apt-get install -y --no-install-recommends \
-            bash ca-certificates cmake curl e2fsprogs git liblz4-dev libselinux1-dev \
-            libtool-bin pkg-config sudo uuid-dev xz-utils zlib1g-dev
+            autoconf automake bash ca-certificates cmake curl e2fsprogs git kmod \
+            liblz4-dev libselinux1-dev libtool libtool-bin pkg-config sudo \
+            uuid-dev xz-utils zlib1g-dev
           rm -rf /var/lib/apt/lists/*
           df -h /
+          # erofs-utils' ./autogen.sh needs these; missing aclocal failed with
+          #   ./autogen.sh: 4: aclocal: not found
+          command -v aclocal autoheader autoreconf libtoolize
 
       # Ubuntu 22.04's erofs-utils is 1.4; -E ztailpacking needs >= 1.6 and the
       # 64K pcluster size (-C 65536) needs >= 1.5. Build 1.7.1 ourselves.
@@ -326,11 +346,23 @@ jobs:
           make install
           mkfs.erofs --version
 
-      - name: Download the kernel modules artifact
+      - name: Download the kernel modules artifact (this run)
+        if: ${{ inputs.kernel_run_id == '' || inputs.build_kernel }}
         uses: actions/download-artifact@v4
         with:
           name: klee-modules
           path: /tmp/klee-modules
+
+      # A retry takes the modules from the run that already built the kernel,
+      # so the expensive build does not have to happen again.
+      - name: Download the kernel modules artifact (run ${{ inputs.kernel_run_id }})
+        if: ${{ inputs.kernel_run_id != '' && !inputs.build_kernel }}
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-modules
+          path: /tmp/klee-modules
+          run-id: ${{ inputs.kernel_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch the UT 24.04-1.x base rootfs
         run: |
@@ -351,61 +383,46 @@ jobs:
 
           PORT="$GITHUB_WORKSPACE/port"
           WORK="$HOME/klee-ut/work"
-          MNT="$WORK/mnt"
-          mkdir -p "$WORK" "$MNT"
+          # Build the tree in a plain directory and point mkfs.erofs straight at
+          # it. The earlier version created an ext4 image and loop-mounted it,
+          # which needs privileges a job container does not reliably have.
+          MNT="$WORK/system"
+          rm -rf "$WORK/base" "$MNT"
+          mkdir -p "$WORK/base"
           cd "$PORT"
 
-          # 1. Unpack the base rootfs ("system/" tree) into a staging dir.
-          mkdir -p "$WORK/base"
+          # 1. Unpack the base rootfs ("system/" tree).
           tar xzf "$HOME/klee-ut/downloads/out/rootfs.tar.gz" -C "$WORK/base" --numeric-owner
-          mv "$WORK/base/system" "$WORK/system"
+          mv "$WORK/base/system" "$MNT"
+          rmdir "$WORK/base" 2>/dev/null || true
 
-          # 2. ext4 image, sized like the sibling port (system_partition_size).
-          #    metadata_csum/orphan_file are disabled: the initrd's e2fsck is 1.43.
-          IMG="$WORK/ubuntu.img"
-          rm -f "$IMG"
-          truncate -s 3584M "$IMG"
-          mkfs.ext4 -q -F -O ^metadata_csum,^orphan_file "$IMG"
-          sudo mount -o loop "$IMG" "$MNT"
+          # 2. Replace the generic GKI modules with the klee ones.
+          rm -rf "$MNT"/usr/lib/modules/*
+          cp -a "/tmp/klee-modules/$KREL" "$MNT/usr/lib/modules/"
+          chown -R root:root "$MNT/usr/lib/modules"
+          depmod -b "$MNT" "$KREL"
 
-          # 3. Install the opaque rootfs content.
-          sudo cp -a "$WORK/system/." "$MNT/"
-
-          # 4. Replace the generic GKI modules with the klee ones.
-          sudo rm -rf "$MNT"/usr/lib/modules/*
-          sudo cp -a "/tmp/klee-modules/$KREL" "$MNT/usr/lib/modules/"
-          sudo chown -R root:root "$MNT/usr/lib/modules"
-          sudo depmod -b "$MNT" "$KREL"
-
-          # 5. klee device overlay + rootfs patches (same order as build-klee.sh).
-          sudo rm -rf "$MNT/usr/lib/modules"/*/build "$MNT/usr/lib/modules"/*/source
-          sudo cp -a --no-preserve=ownership "$PORT/overlay/system/." "$MNT/"
-          sudo chown -R root:root "$MNT/usr/libexec/lxc-android-config" "$MNT/etc/deviceinfo"
+          # 3. klee device overlay + rootfs patches (same order as build-klee.sh).
+          rm -rf "$MNT/usr/lib/modules"/*/build "$MNT/usr/lib/modules"/*/source
+          cp -a --no-preserve=ownership "$PORT/overlay/system/." "$MNT/"
+          chown -R root:root "$MNT/usr/libexec/lxc-android-config" "$MNT/etc/deviceinfo"
           # glob only if it matches something, otherwise chown fails on the literal
           if compgen -G "$MNT/usr/bin/klee-*" >/dev/null; then
-            sudo chown -R root:root "$MNT/usr/bin/klee-"*
+            chown -R root:root "$MNT/usr/bin/klee-"*
           fi
           for p in "$PORT"/rootfs-patches/*.sh; do
             echo "applying rootfs patch: $p"
-            sudo bash "$p" "$MNT"
+            bash "$p" "$MNT"
           done
-          echo "klee $(date -u +%Y%m%d-%H%M)" | sudo tee "$MNT/etc/klee-port-version" >/dev/null
+          echo "klee $(date -u +%Y%m%d-%H%M)" > "$MNT/etc/klee-port-version"
 
-          sync
-          sudo umount "$MNT"
-          e2fsck -fy "$IMG" >/dev/null || true
-
-          # 6. Ship the rootfs as compressed EROFS (3.5 GiB ext4 -> ~1.2 GiB)
-          #    so it fits, with user data, into the free space in super.
-          sudo mount -o loop,ro "$IMG" "$MNT"
-          rm -f "$WORK/ubuntu.erofs"
-          sudo mkfs.erofs -zlz4hc,12 -E ztailpacking -C 65536 "$WORK/ubuntu.erofs" "$MNT" >/dev/null
-          sudo umount "$MNT"
-          sudo chown "$(id -u):$(id -g)" "$WORK/ubuntu.erofs"
-
+          # 4. Ship the rootfs as compressed EROFS so it fits, with user data,
+          #    into the free space in super.
           OUT="$GITHUB_WORKSPACE/release/images"
           mkdir -p "$OUT"
-          cp "$WORK/ubuntu.erofs" "$OUT/ubuntu.img"
+          rm -f "$WORK/ubuntu.erofs" "$OUT/ubuntu.img"
+          mkfs.erofs -zlz4hc,12 -E ztailpacking -C 65536 "$WORK/ubuntu.erofs" "$MNT"
+          mv "$WORK/ubuntu.erofs" "$OUT/ubuntu.img"
           ls -la "$OUT/ubuntu.img"
 
       - name: Upload rootfs image
@@ -425,7 +442,9 @@ jobs:
     # must finish first. With only `needs: kernel` this job could start before
     # rootfs uploaded klee-rootfs and the download would fail.
     needs: [kernel, rootfs]
-    if: ${{ inputs.build_utdata && inputs.build_rootfs }}
+    # rootfs must have produced ubuntu.img in *this* run, but the kernel job may
+    # legitimately be skipped on a retry.
+    if: ${{ always() && inputs.build_utdata && needs.rootfs.result == 'success' }}
     runs-on: ubuntu-22.04
     container: ubuntu:22.04
     timeout-minutes: 120
@@ -454,11 +473,21 @@ jobs:
           name: klee-rootfs
           path: release/images
 
-      - name: Download the boot images
+      - name: Download the boot images (this run)
+        if: ${{ inputs.kernel_run_id == '' || inputs.build_kernel }}
         uses: actions/download-artifact@v4
         with:
           name: klee-boot-images
           path: release/images
+
+      - name: Download the boot images (run ${{ inputs.kernel_run_id }})
+        if: ${{ inputs.kernel_run_id != '' && !inputs.build_kernel }}
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-boot-images
+          path: release/images
+          run-id: ${{ inputs.kernel_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       # The real install.sh cannot run here: it drives adb/fastboot at a phone
       # that does not exist, and it wants a live super partition to size ut_data
