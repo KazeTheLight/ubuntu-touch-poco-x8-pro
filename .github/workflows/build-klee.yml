@@ -470,8 +470,11 @@ jobs:
   # adb + fastboot (both already in platform-tools) to install.
   utdata:
     name: ut_data.img for the Windows installer
-    needs: kernel
-    if: ${{ inputs.build_utdata }}
+    # It needs ubuntu.img from rootfs AND the boot images from kernel, so both
+    # must finish first. With only `needs: kernel` this job could start before
+    # rootfs uploaded klee-rootfs and the download would fail.
+    needs: [kernel, rootfs]
+    if: ${{ inputs.build_utdata && inputs.build_rootfs }}
     runs-on: ubuntu-22.04
     container: ubuntu:22.04
     timeout-minutes: 120
@@ -498,6 +501,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: klee-rootfs
+          path: release/images
+
+      - name: Download the boot images
+        uses: actions/download-artifact@v4
+        with:
+          name: klee-boot-images
           path: release/images
 
       # The real install.sh cannot run here: it drives adb/fastboot at a phone
