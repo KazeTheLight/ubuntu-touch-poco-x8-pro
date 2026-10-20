@@ -1,0 +1,3 @@
+/bin/sh /scripts/panic/kmsgdump "$@"
+/scripts/panic/telnet "$@"
+[ -e /conf/param.conf ] && . /conf/param.conf

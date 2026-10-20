@@ -1,0 +1,66 @@
+#!/bin/sh
+# klee: the kernel console in pstore is truncated (the record holds only the
+# first ~58 KB, which ends right at "waiting for /dev/disk/by-partlabel/super"),
+# so the interesting tail -- why ufshcd never probes and what the initramfs does
+# after the 30 s wait -- is lost.
+#
+# This runs from local-premount (before the super wait) and keeps a rolling
+# dmesg snapshot in the `expdb` partition at 1 MiB, which the MTK LK never
+# touches (it writes its own log near 0x7C00000). Android does not write expdb
+# on a normal boot either, so the snapshot survives until we read it back.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+find_part() {
+    for d in /dev/disk/by-partlabel/$1 /dev/block/by-name/$1 \
+             /dev/block/platform/*/by-name/$1 /dev/block/platform/*/*/by-name/$1; do
+        [ -b "$d" ] && { echo "$d"; return 0; }
+    done
+    for u in /sys/class/block/*/uevent; do
+        if grep -q "^PARTNAME=$1$" "$u" 2>/dev/null; then
+            b=$(basename $(dirname "$u"))
+            for d in "/dev/$b" "/dev/block/$b"; do
+                [ -b "$d" ] && { echo "$d"; return 0; }
+            done
+        fi
+    done
+    return 1
+}
+
+(
+    mkdir -p /tmp 2>/dev/null
+    i=0
+    while [ $i -lt 120 ]; do
+        {
+            echo "=== KLEEDIAG v3 seq=$i uptime=$(cat /proc/uptime 2>/dev/null) ==="
+            echo "--- cmdline ---"
+            cat /proc/cmdline 2>/dev/null
+            echo "--- by-partlabel ---"
+            ls /dev/disk/by-partlabel 2>/dev/null | tr '\n' ' '
+            echo
+            echo "--- dev ---"
+            ls /dev/sd* /dev/block/sd* 2>/dev/null | tr '\n' ' '
+            echo
+            echo "--- lsmod ---"
+            cat /proc/modules 2>/dev/null
+            echo "--- dmesg ---"
+            dmesg 2>/dev/null | tail -n 600
+            echo "=== KLEEDIAG END v3 ==="
+        } > /tmp/klee-diag.txt 2>&1
+        dev=$(find_part expdb)
+        if [ -n "$dev" ]; then
+            dd if=/tmp/klee-diag.txt of="$dev" bs=4096 seek=256 conv=notrunc 2>/dev/null
+            sync
+        fi
+        dev2=$(find_part oops)
+        if [ -n "$dev2" ]; then
+            dd if=/tmp/klee-diag.txt of="$dev2" bs=4096 conv=notrunc 2>/dev/null
+        fi
+        sleep 2
+        i=$((i+1))
+    done
+) &
+exit 0

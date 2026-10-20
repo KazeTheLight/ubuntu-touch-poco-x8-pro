@@ -1,0 +1,51 @@
+#!/bin/sh
+# klee: when the initramfs gives up (usually "Couldn't find super partition"
+# after the 30 s wait) dump the whole dmesg into expdb at 1 MiB, so the reason
+# is readable after booting Android again.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+find_part() {
+    for d in /dev/disk/by-partlabel/$1 /dev/block/by-name/$1 \
+             /dev/block/platform/*/by-name/$1 /dev/block/platform/*/*/by-name/$1; do
+        [ -b "$d" ] && { echo "$d"; return 0; }
+    done
+    for u in /sys/class/block/*/uevent; do
+        if grep -q "^PARTNAME=$1$" "$u" 2>/dev/null; then
+            b=$(basename $(dirname "$u"))
+            for d in "/dev/$b" "/dev/block/$b"; do
+                [ -b "$d" ] && { echo "$d"; return 0; }
+            done
+        fi
+    done
+    return 1
+}
+
+mkdir -p /tmp 2>/dev/null
+{
+    echo "=== KLEEPANIC v3 reason=[$*] uptime=$(cat /proc/uptime 2>/dev/null) ==="
+    echo "--- cmdline ---"
+    cat /proc/cmdline 2>/dev/null
+    echo "--- by-partlabel ---"
+    ls /dev/disk/by-partlabel 2>/dev/null | tr '\n' ' '
+    echo
+    echo "--- lsmod ---"
+    cat /proc/modules 2>/dev/null
+    echo "--- dmesg ---"
+    dmesg 2>/dev/null | tail -n 4000
+    echo "=== KLEEPANIC END v3 ==="
+} > /tmp/klee-panic.txt 2>&1
+
+for t in expdb oops; do
+    dev=$(find_part $t) || continue
+    if [ "$t" = "expdb" ]; then
+        dd if=/tmp/klee-panic.txt of="$dev" bs=4096 seek=256 conv=notrunc 2>/dev/null
+    else
+        dd if=/tmp/klee-panic.txt of="$dev" bs=4096 conv=notrunc 2>/dev/null
+    fi
+done
+sync
+exit 0
