@@ -54,6 +54,13 @@ rm -rf "$PORT/workdir/tmp"; mkdir -p "$PORT/workdir/tmp/partitions"
 )
 cp "$PORT/workdir/tmp/partitions/boot.img" "$REL/ut_boot.img"
 cp "$PORT/workdir/tmp/partitions/init_boot.img" "$REL/ut_init_boot.img"
+# UT-owned vendor_boot (tiny: our ramdisk, no Android userspace). It is built
+# now that port/vendor-ramdisk-overlay exists, and it must be flashed together
+# with the other two: the stock one carries Android's /init and wins the
+# unpack race on this LK (see port/vendor-ramdisk-overlay/README).
+if [ -f "$PORT/workdir/tmp/partitions/vendor_boot.img" ]; then
+	cp "$PORT/workdir/tmp/partitions/vendor_boot.img" "$REL/ut_vendor_boot.img"
+fi
 
 # Single image (kernel + ramdisk) for a no-flash "fastboot boot" attempt
 source "$PORT/deviceinfo"

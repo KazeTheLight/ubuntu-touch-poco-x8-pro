@@ -1,0 +1,18 @@
+klee vendor_boot ramdisk (UT-owned)
+===================================
+
+The stock Xiaomi vendor_boot on klee carries a ~60 MB Android userspace
+ramdisk.  Halium ports normally leave vendor_boot untouched, but on this device
+that breaks booting Ubuntu Touch, because:
+
+  * LK builds one initrd out of vendor_boot's ramdisk + init_boot's ramdisk
+    (that is the "ramdisk_map_sz" it checks against the 64 MiB mb_ramdisk), and
+  * the vendor part is unpacked LAST, so its /init (Android's) overwrote the
+    Halium /init, and Android's init aborted with
+        mount("selinuxfs", ...) failed -> InitFatalReboot
+    because the UT kernel is built without SELinux.
+
+Keeping this directory (even with an empty modules.load) makes
+build/make-bootimage.sh emit a UT-owned, tiny vendor_boot.img instead of
+relying on the stock one.  Add module file names to lib/modules/modules.load
+if a boot stage needs a .ko that is not built into the klee kernel.

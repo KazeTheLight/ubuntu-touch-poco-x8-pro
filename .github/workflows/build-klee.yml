@@ -256,6 +256,11 @@ jobs:
              "$HOME/poco x8 pro ub touch/release/images/ut_init_boot.img" \
              "$HOME/poco x8 pro ub touch/release/images/ut_boot_fastboot-boot.img" \
              "$GITHUB_WORKSPACE/out/boot/"
+          # UT-owned vendor_boot (small, no Android userspace). Optional so an
+          # older tree that lacks vendor-ramdisk-overlay still builds.
+          if [ -f "$HOME/poco x8 pro ub touch/release/images/ut_vendor_boot.img" ]; then
+            cp "$HOME/poco x8 pro ub touch/release/images/ut_vendor_boot.img" "$GITHUB_WORKSPACE/out/boot/"
+          fi
           # and the installed modules, needed by the rootfs + utdata jobs
           mkdir -p "$GITHUB_WORKSPACE/out/modules"
           cp -a "$HOME/klee-ut/work/modroot/lib/modules/." "$GITHUB_WORKSPACE/out/modules/"
@@ -294,6 +299,7 @@ jobs:
             out/boot/ut_boot.img
             out/boot/ut_init_boot.img
             out/boot/ut_boot_fastboot-boot.img
+            out/boot/ut_vendor_boot.img
           if-no-files-found: error
           retention-days: 14
 
